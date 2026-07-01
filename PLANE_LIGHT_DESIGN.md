@@ -4,17 +4,16 @@ This document captures a trimmed-down backend/domain design inspired by Plane, f
 
 ## Goal
 
-Build a small “Plane Light” that supports:
+Build a small "Plane Light" that supports:
 
-- Workspaces/teams
 - Projects
-- Project members and basic roles
+- Basic user roles
 - Kanban states/columns
 - Issues/tasks
 - Assignees
 - Basic prioritization and due dates
-- Scrum cycles/sprints
-- Adding/removing issues from cycles
+- Scrum sprints (equivalent to Plane's Cycle)
+- Adding/removing issues from sprints
 - Board/list filtering
 
 Out of scope for the first version:
@@ -40,136 +39,161 @@ Out of scope for the first version:
 
 ## Core Domain Model
 
-The minimal useful domain is:
+Plane Light is a self-hosted, single-tenant internal tool. Do not carry Plane's workspace multi-tenancy into the MVP domain. The project is the top-level work container.
+
+The minimum Laravel/Eloquent domain is:
 
 ```text
-Workspace -> Project -> State -> Issue
-                     -> Cycle -> CycleIssue
-                     -> IssueAssignee
+Project -> State -> Issue
+        -> Sprint
+        -> Label
+Issue   -> Comment
+User    -> issues through assignees / authorship
 ```
+
+Two relationships need many-to-many pivot tables. In Laravel these are just a migration plus a `belongsToMany` call on each model — no pivot model class is needed unless the pivot gains extra fields.
+
+```text
+Table             Columns                    Constraints
+issue_assignees   issue_id, user_id          unique(issue_id, user_id), index(user_id)
+issue_labels      issue_id, label_id          unique(issue_id, label_id), index(label_id)
+```
+
+Rules:
+- Pairs must be unique (enforced by composite primary key).
+- Do not create a pivot model (`extends Pivot`) until the relationship gains extra fields like `assigned_by_id`, `applied_by_id`, or `applied_at`.
+
+The `belongsToMany` declarations are listed in the relevant model sections below.
 
 Optional but useful later:
 
 ```text
-Project -> Label -> IssueLabel
-Issue   -> IssueComment
-Issue   -> Sub-issues via parentId
+Issue -> Sub-issues via parent_id
 ```
 
-### ER Diagram
+## Eloquent Model Definitions
 
-```mermaid
-erDiagram
-    User ||--o{ WorkspaceMember : belongs_to
-    Workspace ||--o{ WorkspaceMember : has
-    Workspace ||--o{ Project : contains
-    Project ||--o{ ProjectMember : has
-    User ||--o{ ProjectMember : joins
+Use Laravel naming conventions unless there is a strong reason not to:
 
-    Project ||--o{ State : defines
-    Project ||--o{ Issue : contains
-    State ||--o{ Issue : categorizes
+- Tables use plural `snake_case`: `projects`, `states`, `issues`.
+- Columns use `snake_case`: `project_id`, `created_by_id`, `completed_at`.
+- Models use singular PascalCase: `Project`, `State`, `Issue`.
+- Prefer Laravel enum casts for closed sets such as roles, state groups, priorities, and sprint status.
+- Prefer soft/archive timestamps such as `archived_at` over hard deletes for project-level work records.
+- Do not add `workspace_id` or workspace-scoped uniqueness in the MVP; this is a single-tenant app.
 
-    Issue ||--o{ IssueAssignee : assigned_to
-    User ||--o{ IssueAssignee : assignee
+### Enums
 
-    Project ||--o{ Cycle : has
-    Cycle ||--o{ CycleIssue : contains
-    Issue ||--o{ CycleIssue : included_in
+```php
+enum Role: string
+{
+    case Admin = 'admin';
+    case Member = 'member';
+    case Viewer = 'viewer';
+}
 
-    Project ||--o{ Label : has
-    Label ||--o{ IssueLabel : tags
-    Issue ||--o{ IssueLabel : tagged_by
-```
+enum StateGroup: string
+{
+    case Backlog = 'backlog';
+    case Unstarted = 'unstarted';
+    case Started = 'started';
+    case Completed = 'completed';
+    case Cancelled = 'cancelled';
+}
 
----
+enum IssuePriority: string
+{
+    case Urgent = 'urgent';
+    case High = 'high';
+    case Medium = 'medium';
+    case Low = 'low';
+    case None = 'none';
+}
 
-## Model Definitions
-
-### User
-
-```ts
-User {
-  id: uuid
-  email: string
-  name: string
-  avatarUrl?: string
-  createdAt: datetime
-  updatedAt: datetime
+enum SprintStatus: string
+{
+    case Planned = 'planned';
+    case Active = 'active';
+    case Completed = 'completed';
 }
 ```
 
-### Workspace
+### `users`
 
-Top-level tenant/team boundary.
+Laravel's default `User` model can be reused. Authorization is handled per-project via `ProjectMember` (see below).
 
-```ts
-Workspace {
-  id: uuid
-  name: string
-  slug: string
-  ownerId: uuid
-  timezone: string
-  createdAt: datetime
-  updatedAt: datetime
-}
+Important columns:
+
+```text
+id
+name
+email
+is_active boolean default true
+avatar_url nullable
+created_at
+updated_at
+```
+
+Relationships:
+
+```text
+hasMany Project as ledProjects via lead_id
+hasMany ProjectMember as memberships
+belongsToMany Issue as assignedIssues via issue_assignees
+hasMany Issue as createdIssues via created_by_id
+hasMany Issue as updatedIssues via updated_by_id
+hasMany Comment as authoredComments via author_id
 ```
 
 Rules:
 
-- `slug` is globally unique.
-- Owner is automatically workspace admin.
-- Projects live inside workspaces.
+- `is_active = false` disables access without deleting historical authorship/assignment references.
+- Authorization role is determined by `ProjectMember.role` (see below).
 
-### WorkspaceMember
+### `projects`
 
-```ts
-type Role = "admin" | "member" | "viewer";
+Top-level work container.
 
-WorkspaceMember {
-  id: uuid
-  workspaceId: uuid
-  userId: uuid
-  role: Role
-  isActive: boolean
-  createdAt: datetime
-  updatedAt: datetime
-}
+Important columns:
+
+```text
+id
+name
+identifier // e.g. WEB, API, OPS
+nullable description text
+nullable lead_id foreignId -> users.id
+nullable default_state_id foreignId -> states.id
+nullable archived_at timestamp
+created_at
+updated_at
+```
+
+Relationships:
+
+```text
+belongsTo User as lead
+belongsTo State as defaultState
+hasMany ProjectMember
+hasMany State
+hasMany Issue
+hasMany Sprint
+hasMany Label
+hasMany Comment
+```
+
+Indexes/constraints:
+
+```text
+unique(identifier)
+unique(name) // optional; identifier uniqueness is the important one
+index(archived_at)
 ```
 
 Rules:
 
-- A user can belong to a workspace once.
-- Admins can manage workspace/project settings.
-- Members can create/update issues.
-- Viewers can read only.
-
-### Project
-
-Main work container.
-
-```ts
-Project {
-  id: uuid
-  workspaceId: uuid
-  name: string
-  identifier: string // e.g. WEB, API, OPS
-  description?: string
-  leadId?: uuid
-  defaultStateId?: uuid
-  archivedAt?: datetime
-  createdAt: datetime
-  updatedAt: datetime
-}
-```
-
-Rules:
-
-- `identifier` is unique per workspace.
-- `name` is unique per workspace.
-- `identifier` is normalized to uppercase.
+- `identifier` is user-chosen, persisted, globally unique, and normalized to uppercase.
+- `identifier + sequence_id` creates stable work item keys like `WEB-1`.
 - Creating a project creates default states.
-- Creating a project adds the creator as project admin/member.
 
 Default states:
 
@@ -181,536 +205,418 @@ Done         -> completed
 Cancelled    -> cancelled
 ```
 
-### ProjectMember
+### `project_members`
 
-Optional in an ultra-simple v1. If omitted, workspace members can access all workspace projects.
+Links users to projects with a role.
 
-```ts
-ProjectMember {
-  id: uuid
-  workspaceId: uuid
-  projectId: uuid
-  userId: uuid
-  role: Role
-  isActive: boolean
-  createdAt: datetime
-  updatedAt: datetime
-}
+Important columns:
+
+```text
+id
+project_id foreignId -> projects.id
+user_id foreignId -> users.id
+role Role cast default member
+is_active boolean default true
+created_at
+updated_at
+```
+
+Relationships:
+
+```text
+belongsTo Project
+belongsTo User
+```
+
+Indexes/constraints:
+
+```text
+unique(project_id, user_id)
+index(project_id, role)
+index(user_id)
 ```
 
 Rules:
 
-- A user can only be a project member once.
-- Project access requires workspace membership.
+- A user can be added to a project once.
+- Admins can manage project settings, workflow states, labels, and members.
+- Members can create/update issues and comments.
+- Viewers can read only.
+- `is_active = false` suspends access without removing history.
+- Deleting a project member reassigns their issues to the project lead or unassigns them.
 
-### State
+### `states`
 
 Kanban column/workflow state.
 
-```ts
-type StateGroup =
-  | "backlog"
-  | "unstarted"
-  | "started"
-  | "completed"
-  | "cancelled";
+Important columns:
 
-State {
-  id: uuid
-  workspaceId: uuid
-  projectId: uuid
-  name: string
-  slug: string
-  color: string
-  sequence: number
-  group: StateGroup
-  isDefault: boolean
-  createdAt: datetime
-  updatedAt: datetime
-}
+```text
+id
+project_id foreignId -> projects.id
+name
+slug
+color
+sequence unsignedInteger
+group StateGroup cast
+is_default boolean default false
+created_at
+updated_at
+```
+
+Relationships:
+
+```text
+belongsTo Project
+hasMany Issue
+```
+
+Indexes/constraints:
+
+```text
+unique(project_id, name)
+unique(project_id, slug)
+index(project_id, sequence)
+index(project_id, group)
 ```
 
 Rules:
 
-- State names are unique per project.
 - States are ordered by `sequence`.
-- One state can be marked default.
+- One state can be marked default per project.
 - Default state cannot be deleted.
 - A state cannot be deleted while issues are in it.
 - Issue completion is derived from the state group.
 
-### Issue
+### `issues`
 
 Central task/work item.
 
-```ts
-type Priority = "urgent" | "high" | "medium" | "low" | "none";
+Important columns:
 
-Issue {
-  id: uuid
-  workspaceId: uuid
-  projectId: uuid
-  stateId: uuid
-  parentId?: uuid
-  sequenceId: number
-  sortOrder: number
-  title: string
-  description?: string
-  priority: Priority
-  startDate?: date
-  dueDate?: date
-  completedAt?: datetime
-  archivedAt?: datetime
-  createdById: uuid
-  updatedById?: uuid
-  createdAt: datetime
-  updatedAt: datetime
-}
+```text
+id
+project_id foreignId -> projects.id
+state_id foreignId -> states.id
+nullable sprint_id foreignId -> sprints.id
+nullable parent_id foreignId -> issues.id
+sequence_id unsignedInteger
+sort_order decimal or unsignedBigInteger
+title
+nullable description text
+priority IssuePriority cast default none
+nullable start_date date
+nullable due_date date
+nullable completed_at timestamp
+nullable archived_at timestamp
+created_by_id foreignId -> users.id
+nullable updated_by_id foreignId -> users.id
+created_at
+updated_at
+```
+
+Relationships:
+
+```text
+belongsTo Project
+belongsTo State
+belongsTo Sprint nullable
+belongsTo Issue as parent
+hasMany Issue as children via parent_id
+belongsTo User as creator via created_by_id
+belongsTo User as updater via updated_by_id
+belongsToMany User as assignees via issue_assignees
+belongsToMany Label via issue_labels
+hasMany Comment
+```
+
+Indexes/constraints:
+
+```text
+unique(project_id, sequence_id)
+index(project_id, state_id, sort_order)
+index(project_id, sprint_id)
+index(project_id, priority)
+index(project_id, archived_at)
+index(created_by_id)
 ```
 
 Rules:
 
-- If no state is provided, use project default state.
-- `sequenceId` is unique per project and generates issue keys like `WEB-1`.
-- `sortOrder` controls board ordering inside a state/column.
-- Moving to a `completed` state sets `completedAt`.
-- Moving out of a `completed` state clears `completedAt`.
-- Assignees must be workspace/project members.
+- If no state is provided, use the project default state.
+- `sequence_id` is unique per project and generates issue keys like `WEB-1`.
+- `sort_order` controls board ordering inside a state/column.
+- Moving to a `completed` state sets `completed_at`.
+- Moving out of a `completed` state clears `completed_at`.
+- Assignees must be active users.
 
-### IssueAssignee
+### `sprints`
 
-```ts
-IssueAssignee {
-  id: uuid
-  workspaceId: uuid
-  projectId: uuid
-  issueId: uuid
-  userId: uuid
-  createdAt: datetime
-}
+Scrum sprint/timebox. Equivalent to Plane's Cycle concept.
+
+Important columns:
+
+```text
+id
+project_id foreignId -> projects.id
+name
+nullable description text
+nullable start_date date
+nullable end_date date
+owner_id foreignId -> users.id // sprint lead; defaults to creator
+status SprintStatus cast default planned
+nullable archived_at timestamp
+created_at
+updated_at
+```
+
+Relationships:
+
+```text
+belongsTo Project
+belongsTo User as owner
+hasMany Issue
+```
+
+Indexes/constraints:
+
+```text
+index(project_id, status)
+index(project_id, start_date, end_date)
 ```
 
 Rules:
 
-- Same user cannot be assigned twice to the same issue.
-- Assignee must be a valid workspace/project member.
+- Sprint belongs to one project.
+- Optional rule: only one active sprint per project.
+- Completed sprints should be mostly read-only.
+- Sprint can only be deleted by project admins or its owner.
 
-### Cycle
+### Sprint assignment
 
-Scrum sprint/timebox.
+For Plane Light, model sprint membership directly on `issues.sprint_id` instead of using a pivot table.
 
-```ts
-type CycleStatus = "planned" | "active" | "completed";
+This keeps the Laravel relationship simple:
 
-Cycle {
-  id: uuid
-  workspaceId: uuid
-  projectId: uuid
-  name: string
-  description?: string
-  startDate?: datetime
-  endDate?: datetime
-  ownerId: uuid
-  status: CycleStatus
-  archivedAt?: datetime
-  createdAt: datetime
-  updatedAt: datetime
-}
+```text
+Sprint hasMany Issue
+Issue belongsTo Sprint nullable
 ```
 
 Rules:
 
-- Cycle belongs to one project.
-- Optional rule: only one active cycle per project.
-- Completed cycles should be mostly read-only.
+- An issue can belong to zero or one sprint at a time.
+- Issue and sprint must belong to the same project.
+- Moving an issue between sprints is a normal issue update: change `sprint_id`.
+- Use a pivot table only if the product later needs sprint history, spillover tracking, or many-to-many sprint planning metadata.
 
-### CycleIssue
+### `labels`
 
-```ts
-CycleIssue {
-  id: uuid
-  workspaceId: uuid
-  projectId: uuid
-  cycleId: uuid
-  issueId: uuid
-  createdAt: datetime
-}
+Project-scoped reusable tags.
+
+Important columns:
+
+```text
+id
+project_id foreignId -> projects.id
+name
+color
+created_at
+updated_at
 ```
 
-Rules:
+Relationships:
 
-- Same issue cannot be added to the same cycle twice.
-- Issue must belong to the same project as the cycle.
-- Optional strict Scrum rule: issue can only be in one planned/active cycle at a time.
-
-### Optional: Label / IssueLabel
-
-```ts
-Label {
-  id: uuid
-  workspaceId: uuid
-  projectId: uuid
-  name: string
-  color: string
-  createdAt: datetime
-  updatedAt: datetime
-}
-
-IssueLabel {
-  id: uuid
-  workspaceId: uuid
-  projectId: uuid
-  issueId: uuid
-  labelId: uuid
-}
+```text
+belongsTo Project
+belongsToMany Issue via issue_labels
 ```
 
-Rules:
+Indexes/constraints:
 
-- Label name is unique per project.
-- Issue-label pair is unique.
+```text
+unique(project_id, name)
+```
 
-### Optional: IssueComment
+### `comments`
 
-```ts
-IssueComment {
-  id: uuid
-  workspaceId: uuid
-  projectId: uuid
-  issueId: uuid
-  authorId: uuid
-  body: string
-  createdAt: datetime
-  updatedAt: datetime
-}
+Important columns:
+
+```text
+id
+project_id foreignId -> projects.id
+issue_id foreignId -> issues.id
+author_id foreignId -> users.id
+body text
+created_at
+updated_at
+```
+
+Relationships:
+
+```text
+belongsTo Project
+belongsTo Issue
+belongsTo User as author
+```
+
+### Minimal Domain UML
+
+```mermaid
+classDiagram
+    class User
+    class Project
+    class ProjectMember
+    class State
+    class Issue
+    class Sprint
+    class Label
+    class Comment
+
+    User "0..1" -- "0..*" Project : leads
+    User "1" -- "0..*" ProjectMember : member_of
+    Project "1" *-- "0..*" ProjectMember : has
+
+    Project "1" *-- "1..*" State : workflow
+    Project "1" -- "0..1" State : default
+    Project "1" *-- "0..*" Issue : contains
+    State "1" -- "0..*" Issue : current state
+    Issue "0..1" -- "0..*" Issue : parent of
+    User "1" -- "0..*" Issue : creates
+    User "0..1" -- "0..*" Issue : updates
+
+    Issue "0..*" -- "0..*" User : assignees
+
+    Project "1" *-- "0..*" Sprint : contains
+    User "1" -- "0..*" Sprint : owns
+    Sprint "0..1" -- "0..*" Issue : includes
+
+    Project "1" *-- "0..*" Label : contains
+    Issue "0..*" -- "0..*" Label : labels
+
+    Project "1" *-- "0..*" Comment : contains
+    Issue "1" *-- "0..*" Comment : comments
+    User "1" -- "0..*" Comment : authors
 ```
 
 ---
 
-## MVC Design
+## Laravel + Inertia Backend Design
 
-This maps Plane’s Django-style structure into a generic MVC backend:
+Use a conventional Laravel app with Inertia serving the UI. Keep the design close to Laravel defaults to reduce boilerplate:
 
-- **Models**: database/domain entities.
-- **Controllers**: HTTP/API actions and orchestration.
-- **Views**: JSON serializers/API response DTOs, plus frontend screens if using full-stack MVC terminology.
+- **Models**: Eloquent models for first-class domain entities.
+- **Controllers**: Resource Controllers for CRUD.
+- **Validation/authorization**: Form Requests and Policies.
+- **Serialization**: Eloquent API Resources for JSON/Inertia props.
+- **UI**: Inertia pages under `resources/js/Pages`.
+- **Workflow logic**: small service/action methods only when controller code would become unclear.
 
-### Suggested Backend Structure
+### Structure Approach
 
-```text
-models/
-  user
-  workspace
-  project
-  state
-  issue
-  cycle
-  label          optional
-  comment        optional
+Do not prescribe a custom folder structure up front. Start from the structure generated by the chosen Laravel + Inertia bootstrap path.
 
-controllers/
-  auth-controller
-  workspace-controller
-  workspace-member-controller
-  project-controller
-  project-member-controller
-  state-controller
-  issue-controller
-  board-controller
-  cycle-controller
-  cycle-issue-controller
-  label-controller        optional
-  issue-comment-controller optional
+Add application-specific classes only where Laravel conventions make them useful:
 
-views-or-serializers/
-  workspace-response
-  project-response
-  state-response
-  issue-response
-  board-response
-  cycle-response
-```
+- Eloquent models for first-class domain entities.
+- Resource Controllers for CRUD-like resources.
+- Form Requests when validation/authorization grows beyond simple cases.
+- Gates for role-level authorization (e.g. `is-admin`, `is-member`) and Policies for model-scoped authorization (e.g. project access, issue mutations).
+- API Resources when response/Inertia prop shaping needs to be explicit.
+- Small action/service classes only when a workflow becomes too large for a controller method.
 
----
+The goal is to lean on generated framework structure, not lock the application into a hand-designed directory layout before implementation.
 
-## Controllers and Responsibilities
+### Routing Approach
 
-### AuthController
+Use `routes/web.php` for Inertia pages and mutations. Prefer `Route::resource` for normal CRUD and add named custom routes only for domain actions.
 
 ```text
-POST /auth/signup
-POST /auth/login
-POST /auth/logout
-GET  /auth/me
+/projects
+  -> ProjectController resource
+
+/projects/{project}/members
+  -> ProjectMemberController resource
+
+/projects/{project}/states
+  -> StateController resource
+  + POST states/reorder
+  + POST states/{state}/default
+
+/projects/{project}/issues
+  -> IssueController resource
+  + POST issues/{issue}/move
+  + PUT issues/{issue}/assignees
+
+/projects/{project}/board
+  -> invokable BoardController
+
+/projects/{project}/sprints
+  -> SprintController resource
+  + POST sprints/{sprint}/start
+  + POST sprints/{sprint}/complete
+  + PUT sprints/{sprint}/issues
+
+/projects/{project}/labels
+  -> LabelController resource
+
+/projects/{project}/issues/{issue}/comments
+  -> CommentController resource
 ```
 
-Responsibilities:
+Use scoped route model binding so `State`, `Issue`, `Sprint`, `Label`, and `Comment` are always resolved inside the current project context.
 
-- Register user.
-- Authenticate user.
-- Return current session/user.
+### Controller Responsibilities
 
-### WorkspaceController
+| Controller | Role |
+| --- | --- |
+| `ProjectController` | Project CRUD; create default states on project creation. |
+| `ProjectMemberController` | Project member CRUD and role management. |
+| `StateController` | Workflow column CRUD, default state, and state ordering. |
+| `IssueController` | Issue CRUD, filters, assignment sync, and issue movement. |
+| `BoardController` | Read-only board page/read model grouped by state. |
+| `SprintController` | Sprint CRUD, start/complete lifecycle, and issue membership sync. |
+| `LabelController` | Project-scoped label CRUD. |
+| `CommentController` | Issue comment CRUD. |
+
+Mutation controllers should usually validate through Form Requests, authorize through Policies, perform the write, and redirect back with flash data for Inertia.
+
+### Eloquent API Resources
+
+Use API Resources as the serialization boundary for both JSON responses and Inertia props.
+
+Recommended resources:
 
 ```text
-GET    /workspaces
-POST   /workspaces
-GET    /workspaces/:slug
-PATCH  /workspaces/:slug
-DELETE /workspaces/:slug
+UserResource
+ProjectResource
+StateResource
+IssueResource
+BoardResource
+SprintResource
+LabelResource
+CommentResource
 ```
 
-Responsibilities:
+Guidelines:
 
-- Create workspace.
-- Assign creator as owner/admin.
-- Validate unique slug.
-- List workspaces current user belongs to.
-
-### WorkspaceMemberController
-
-```text
-GET    /workspaces/:slug/members
-POST   /workspaces/:slug/members
-PATCH  /workspaces/:slug/members/:memberId
-DELETE /workspaces/:slug/members/:memberId
-```
-
-Responsibilities:
-
-- Add members.
-- Change roles.
-- Remove/deactivate members.
-- Enforce admin-only management.
-
-### ProjectController
-
-```text
-GET    /workspaces/:slug/projects
-POST   /workspaces/:slug/projects
-GET    /workspaces/:slug/projects/:projectId
-PATCH  /workspaces/:slug/projects/:projectId
-DELETE /workspaces/:slug/projects/:projectId
-```
-
-Responsibilities:
-
-- Create project.
-- Generate default states.
-- Add creator as project admin/member.
-- Enforce unique project identifier/name.
-- Archive/delete project.
-
-Project creation flow:
-
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant PC as ProjectController
-    participant P as Project
-    participant S as State
-    participant PM as ProjectMember
-
-    C->>PC: POST /projects
-    PC->>P: create project
-    PC->>S: create default states
-    PC->>P: set defaultState
-    PC->>PM: add creator as project admin
-    PC-->>C: project response
-```
-
-### StateController
-
-```text
-GET    /workspaces/:slug/projects/:projectId/states
-POST   /workspaces/:slug/projects/:projectId/states
-PATCH  /workspaces/:slug/projects/:projectId/states/:stateId
-DELETE /workspaces/:slug/projects/:projectId/states/:stateId
-POST   /workspaces/:slug/projects/:projectId/states/:stateId/default
-POST   /workspaces/:slug/projects/:projectId/states/reorder
-```
-
-Responsibilities:
-
-- List states ordered by `sequence`.
-- Create custom states.
-- Rename/update color/group.
-- Mark default state.
-- Prevent deletion of default state.
-- Prevent deletion of non-empty state.
-- Reorder board columns.
-
-### IssueController
-
-```text
-GET    /workspaces/:slug/projects/:projectId/issues
-POST   /workspaces/:slug/projects/:projectId/issues
-GET    /workspaces/:slug/projects/:projectId/issues/:issueId
-PATCH  /workspaces/:slug/projects/:projectId/issues/:issueId
-DELETE /workspaces/:slug/projects/:projectId/issues/:issueId
-POST   /workspaces/:slug/projects/:projectId/issues/:issueId/move
-POST   /workspaces/:slug/projects/:projectId/issues/:issueId/assignees
-DELETE /workspaces/:slug/projects/:projectId/issues/:issueId/assignees/:userId
-```
-
-Supported query params:
-
-```text
-stateId
-assigneeId
-priority
-cycleId
-search
-includeDone
-```
-
-Responsibilities:
-
-- Create issues.
-- Resolve default state.
-- Generate issue key via project identifier + sequence ID.
-- Assign/unassign users.
-- Move issues between states.
-- Maintain `sortOrder`.
-- Sync `completedAt` from target state group.
-- List/filter issues for backlog, list, board, and sprint views.
-
-Issue creation flow:
-
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant IC as IssueController
-    participant P as Project
-    participant S as State
-    participant I as Issue
-    participant A as IssueAssignee
-
-    C->>IC: POST /issues
-    IC->>P: load project
-    IC->>S: resolve state or default state
-    IC->>I: get next sequenceId
-    IC->>I: create issue
-    IC->>A: create assignees
-    IC-->>C: issue response with key
-```
-
-Issue move flow:
-
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant IC as IssueController
-    participant I as Issue
-    participant S as State
-
-    C->>IC: POST /issues/:id/move {stateId, sortOrder}
-    IC->>I: load issue
-    IC->>S: load target state
-    IC->>I: update stateId/sortOrder
-    alt target group is completed
-        IC->>I: set completedAt = now
-    else target group is not completed
-        IC->>I: clear completedAt
-    end
-    IC-->>C: updated issue
-```
-
-### BoardController
-
-Can be separate or folded into `IssueController`.
-
-```text
-GET /workspaces/:slug/projects/:projectId/board
-GET /workspaces/:slug/projects/:projectId/cycles/:cycleId/board
-```
-
-Responsibilities:
-
-- Load project states.
-- Load issues filtered by project or cycle.
-- Group issues by state.
-- Sort states by `sequence`.
-- Sort issues by `sortOrder`.
-
-Example response:
-
-```json
-{
-  "states": [
-    {
-      "id": "state_todo",
-      "name": "Todo",
-      "group": "unstarted",
-      "issues": [
-        {
-          "id": "issue_1",
-          "key": "WEB-1",
-          "title": "Build login",
-          "priority": "high",
-          "assignees": []
-        }
-      ]
-    }
-  ]
-}
-```
-
-### CycleController
-
-```text
-GET    /workspaces/:slug/projects/:projectId/cycles
-POST   /workspaces/:slug/projects/:projectId/cycles
-GET    /workspaces/:slug/projects/:projectId/cycles/:cycleId
-PATCH  /workspaces/:slug/projects/:projectId/cycles/:cycleId
-DELETE /workspaces/:slug/projects/:projectId/cycles/:cycleId
-POST   /workspaces/:slug/projects/:projectId/cycles/:cycleId/start
-POST   /workspaces/:slug/projects/:projectId/cycles/:cycleId/complete
-```
-
-Responsibilities:
-
-- Create sprint/cycle.
-- Start sprint.
-- Complete sprint.
-- Optionally enforce one active sprint per project.
-- Return cycle progress.
-
-### CycleIssueController
-
-```text
-GET    /workspaces/:slug/projects/:projectId/cycles/:cycleId/issues
-POST   /workspaces/:slug/projects/:projectId/cycles/:cycleId/issues
-DELETE /workspaces/:slug/projects/:projectId/cycles/:cycleId/issues/:issueId
-```
-
-Responsibilities:
-
-- Add issue to cycle.
-- Remove issue from cycle.
-- Validate issue and cycle belong to same project.
-- Prevent duplicate cycle membership.
+- Use `Resource::collection(...)` for lists.
+- Use `whenLoaded()` for relationships like `assignees`, `labels`, `states`, and `issues`.
+- Use `whenCounted()` for counts like comments, issue totals, or sprint progress.
+- Compute presentation fields like issue key (`WEB-123`) in `IssueResource`.
+- Do not put authorization, validation, or mutation logic in resources.
 
 ---
 
 ## Core Business Logic to Preserve from Plane
 
-### 1. Workspace/project scoping everywhere
+### 1. Project scoping everywhere
 
-Every meaningful object should carry `workspaceId`; most project-level objects should also carry `projectId`.
-
-```text
-Issue belongs to Project
-Project belongs to Workspace
-State belongs to Project
-Cycle belongs to Project
-```
-
-This keeps authorization and querying simple.
+The Eloquent model definitions make `project_id` the main work boundary. Preserve that boundary in every query, policy, route binding, and mutation so states, issues, sprints, labels, and comments cannot leak across projects.
 
 ### 2. Project-local issue keys
 
-Plane’s `Project.identifier + Issue.sequenceId` pattern is worth keeping.
+Plane's `projects.identifier + issues.sequence_id` pattern is worth keeping.
 
 ```text
 WEB-1
@@ -743,9 +649,9 @@ Do not store independent `isDone` unless necessary.
 
 ```text
 if issue.state.group == completed:
-  completedAt = now
+  completed_at = now
 else:
-  completedAt = null
+  completed_at = null
 ```
 
 ### 5. Sparse sort ordering
@@ -763,7 +669,7 @@ Initial examples:
 Insert between two cards:
 
 ```text
-newSortOrder = (before.sortOrder + after.sortOrder) / 2
+new_sort_order = (before.sort_order + after.sort_order) / 2
 ```
 
 Periodically normalize if numbers get too dense.
@@ -775,9 +681,9 @@ Rules:
 ```text
 Cannot delete default state
 Cannot delete state with issues
-Cannot delete workspace/project without admin rights
-Cannot assign non-member to issue
-Cannot add issue to cycle from another project
+Cannot delete project without admin rights
+Cannot assign inactive user to issue
+Cannot add issue to sprint from another project
 ```
 
 ### 7. Keep filters simple
@@ -785,50 +691,33 @@ Cannot add issue to cycle from another project
 Initial filters:
 
 ```text
-state
-assignee
+state_id
+assignee_id
 priority
-cycle
+sprint_id
 search
-createdBy
-dueDate
+created_by_id
+due_date
 ```
 
 Avoid saved views/advanced filter DSL until the basic product is solid.
 
 ---
 
-## Minimal API Map
+## Minimal Route Surface
+
+The concrete route shape should follow the Laravel routing approach above rather than maintaining a second exhaustive API map. The minimum route surface is:
 
 ```text
-/auth/me
-
-/workspaces
-/workspaces/:slug
-/workspaces/:slug/members
-
-/workspaces/:slug/projects
-/workspaces/:slug/projects/:projectId
-
-/workspaces/:slug/projects/:projectId/states
-/workspaces/:slug/projects/:projectId/states/:stateId
-/workspaces/:slug/projects/:projectId/states/:stateId/default
-/workspaces/:slug/projects/:projectId/states/reorder
-
-/workspaces/:slug/projects/:projectId/issues
-/workspaces/:slug/projects/:projectId/issues/:issueId
-/workspaces/:slug/projects/:projectId/issues/:issueId/move
-/workspaces/:slug/projects/:projectId/issues/:issueId/assignees
-
-/workspaces/:slug/projects/:projectId/board
-
-/workspaces/:slug/projects/:projectId/cycles
-/workspaces/:slug/projects/:projectId/cycles/:cycleId
-/workspaces/:slug/projects/:projectId/cycles/:cycleId/issues
-/workspaces/:slug/projects/:projectId/cycles/:cycleId/board
-
-/workspaces/:slug/projects/:projectId/labels optional
-/workspaces/:slug/projects/:projectId/issues/:issueId/comments optional
+Auth/session routes from the chosen Laravel starter kit
+Project resource routes
+Nested project member resource routes
+Nested state resource routes plus default/reorder actions
+Nested issue resource routes plus move/assignee-sync actions
+Project board route
+Nested sprint resource routes plus start/complete actions
+Label resource routes
+Nested comment resource routes
 ```
 
 ---
@@ -837,20 +726,18 @@ Avoid saved views/advanced filter DSL until the basic product is solid.
 
 If translating this into frontend/product screens:
 
-### Workspace
+### Home
 
 ```text
-Workspace switcher
-Workspace settings
-Member management
+Project list
+User/account menu
 ```
 
 ### Project
 
 ```text
-Project list
 Project settings
-Project members optional
+Label settings
 ```
 
 ### Kanban
@@ -864,17 +751,17 @@ Issue detail drawer/page
 ### Scrum
 
 ```text
-Cycle list
-Cycle planning/backlog
-Cycle board
-Cycle summary
+Sprint list
+Sprint planning/backlog
+Sprint board
+Sprint summary
 ```
 
 ### Settings
 
 ```text
 Workflow/state settings
-Labels optional
+Labels
 ```
 
 ---
@@ -883,44 +770,51 @@ Labels optional
 
 ### Phase 1: Kanban core
 
-Models:
+Domain models:
 
 ```text
 User
-Workspace
-WorkspaceMember
 Project
+ProjectMember
 State
 Issue
-IssueAssignee
+Label
+Comment
+```
+
+Relationship tables:
+
+```text
+issue_assignees
+issue_labels
 ```
 
 Features:
 
 ```text
-Create workspace
 Create project
 Create default states
 Create issue
 Move issue across board
 Assign issue
+Label issue
+Comment on issue
 Filter board
 ```
 
 ### Phase 2: Scrum
 
-Models:
+Domain models:
 
 ```text
-Cycle
-CycleIssue
+Sprint
 ```
 
 Features:
 
 ```text
 Create sprint
-Add issues to sprint
+Assign issues to sprint
 Sprint board
 Start/complete sprint
 Basic progress count
@@ -931,8 +825,6 @@ Basic progress count
 Models/features:
 
 ```text
-Labels
-Comments
 Activity log
 ```
 
@@ -955,22 +847,29 @@ Issue relations
 The essence of Plane for basic Kanban/Scrum is:
 
 ```text
-Workspace
 Project
+ProjectMember
 State
 Issue
-IssueAssignee
-Cycle
-CycleIssue
+Label
+Comment
+Sprint
+```
+
+With these persistence-only relationship tables:
+
+```text
+issue_assignees
+issue_labels
 ```
 
 The most valuable Plane ideas to replicate are:
 
-1. Workspace/project scoping
+1. Project scoping
 2. Custom states grouped by semantic state groups
 3. Project-local issue sequence IDs
 4. Sparse sort ordering for drag/drop
-5. Cycles as sprints
+5. Sprints (equivalent to Plane's Cycles)
 6. Issue completion derived from state group
 7. Simple role-based permissions
 
