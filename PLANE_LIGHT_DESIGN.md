@@ -41,7 +41,7 @@ Out of scope for the first version:
 
 Plane Light is a self-hosted, single-tenant internal tool. Do not carry Plane's workspace multi-tenancy into the MVP domain. The project is the top-level work container.
 
-The minimum Laravel/Eloquent domain is:
+The minimum persistence/domain model is:
 
 ```text
 Project -> State -> Issue
@@ -51,7 +51,7 @@ Issue   -> Comment
 User    -> issues through assignees / authorship
 ```
 
-Two relationships need many-to-many pivot tables. In Laravel these are just a migration plus a `belongsToMany` call on each model — no pivot model class is needed unless the pivot gains extra fields.
+Two relationships need many-to-many join tables. These should remain persistence details, not first-class domain entities, unless the join gains its own meaningful fields.
 
 ```text
 Table             Columns                    Constraints
@@ -61,9 +61,9 @@ issue_labels      issue_id, label_id          unique(issue_id, label_id), index(
 
 Rules:
 - Pairs must be unique (enforced by composite primary key).
-- Do not create a pivot model (`extends Pivot`) until the relationship gains extra fields like `assigned_by_id`, `applied_by_id`, or `applied_at`.
+- Do not create standalone domain objects for these joins until the relationship gains extra fields like `assigned_by_id`, `applied_by_id`, or `applied_at`.
 
-The `belongsToMany` declarations are listed in the relevant model sections below.
+The many-to-many relationships are listed in the relevant model sections below.
 
 Optional but useful later:
 
@@ -71,56 +71,37 @@ Optional but useful later:
 Issue -> Sub-issues via parent_id
 ```
 
-## Eloquent Model Definitions
+## Persistence Model Definitions
 
-Use Laravel naming conventions unless there is a strong reason not to:
+Use conventional relational naming unless there is a strong reason not to:
 
 - Tables use plural `snake_case`: `projects`, `states`, `issues`.
 - Columns use `snake_case`: `project_id`, `created_by_id`, `completed_at`.
 - Models use singular PascalCase: `Project`, `State`, `Issue`.
-- Prefer Laravel enum casts for closed sets such as roles, state groups, priorities, and sprint status.
+- Prefer explicit enum-like types for closed sets such as roles, state groups, priorities, and sprint status.
 - Prefer soft/archive timestamps such as `archived_at` over hard deletes for project-level work records.
 - Do not add `workspace_id` or workspace-scoped uniqueness in the MVP; this is a single-tenant app.
 
 ### Enums
 
-```php
-enum Role: string
-{
-    case Admin = 'admin';
-    case Member = 'member';
-    case Viewer = 'viewer';
-}
+```ts
+type Role = "admin" | "member" | "viewer";
 
-enum StateGroup: string
-{
-    case Backlog = 'backlog';
-    case Unstarted = 'unstarted';
-    case Started = 'started';
-    case Completed = 'completed';
-    case Cancelled = 'cancelled';
-}
+type StateGroup =
+  | "backlog"
+  | "unstarted"
+  | "started"
+  | "completed"
+  | "cancelled";
 
-enum IssuePriority: string
-{
-    case Urgent = 'urgent';
-    case High = 'high';
-    case Medium = 'medium';
-    case Low = 'low';
-    case None = 'none';
-}
+type IssuePriority = "urgent" | "high" | "medium" | "low" | "none";
 
-enum SprintStatus: string
-{
-    case Planned = 'planned';
-    case Active = 'active';
-    case Completed = 'completed';
-}
+type SprintStatus = "planned" | "active" | "completed";
 ```
 
 ### `users`
 
-Laravel's default `User` model can be reused. Authorization is handled per-project via `ProjectMember` (see below).
+Represents an authenticated person. Authorization is handled per-project via `ProjectMember` (see below).
 
 Important columns:
 
@@ -129,7 +110,7 @@ id
 name
 email
 is_active boolean default true
-avatar_url nullable
+avatar_url?
 created_at
 updated_at
 ```
@@ -137,12 +118,12 @@ updated_at
 Relationships:
 
 ```text
-hasMany Project as ledProjects via lead_id
-hasMany ProjectMember as memberships
-belongsToMany Issue as assignedIssues via issue_assignees
-hasMany Issue as createdIssues via created_by_id
-hasMany Issue as updatedIssues via updated_by_id
-hasMany Comment as authoredComments via author_id
+one-to-many Project as ledProjects via lead_id
+one-to-many ProjectMember as memberships
+many-to-many Issue as assignedIssues via issue_assignees
+one-to-many Issue as createdIssues via created_by_id
+one-to-many Issue as updatedIssues via updated_by_id
+one-to-many Comment as authoredComments via author_id
 ```
 
 Rules:
@@ -160,10 +141,10 @@ Important columns:
 id
 name
 identifier // e.g. WEB, API, OPS
-nullable description text
-nullable lead_id foreignId -> users.id
-nullable default_state_id foreignId -> states.id
-nullable archived_at timestamp
+description?: text
+lead_id?: FK -> users.id
+default_state_id?: FK -> states.id
+archived_at?: timestamp
 created_at
 updated_at
 ```
@@ -171,14 +152,14 @@ updated_at
 Relationships:
 
 ```text
-belongsTo User as lead
-belongsTo State as defaultState
-hasMany ProjectMember
-hasMany State
-hasMany Issue
-hasMany Sprint
-hasMany Label
-hasMany Comment
+many-to-one User as lead
+many-to-one State as defaultState
+one-to-many ProjectMember
+one-to-many State
+one-to-many Issue
+one-to-many Sprint
+one-to-many Label
+one-to-many Comment
 ```
 
 Indexes/constraints:
@@ -213,9 +194,9 @@ Important columns:
 
 ```text
 id
-project_id foreignId -> projects.id
-user_id foreignId -> users.id
-role Role cast default member
+project_id FK -> projects.id
+user_id FK -> users.id
+role Role default member
 is_active boolean default true
 created_at
 updated_at
@@ -224,8 +205,8 @@ updated_at
 Relationships:
 
 ```text
-belongsTo Project
-belongsTo User
+many-to-one Project
+many-to-one User
 ```
 
 Indexes/constraints:
@@ -253,12 +234,12 @@ Important columns:
 
 ```text
 id
-project_id foreignId -> projects.id
+project_id FK -> projects.id
 name
 slug
 color
-sequence unsignedInteger
-group StateGroup cast
+sequence integer
+group StateGroup
 is_default boolean default false
 created_at
 updated_at
@@ -267,8 +248,8 @@ updated_at
 Relationships:
 
 ```text
-belongsTo Project
-hasMany Issue
+many-to-one Project
+one-to-many Issue
 ```
 
 Indexes/constraints:
@@ -296,21 +277,21 @@ Important columns:
 
 ```text
 id
-project_id foreignId -> projects.id
-state_id foreignId -> states.id
-nullable sprint_id foreignId -> sprints.id
-nullable parent_id foreignId -> issues.id
-sequence_id unsignedInteger
-sort_order decimal or unsignedBigInteger
+project_id FK -> projects.id
+state_id FK -> states.id
+sprint_id?: FK -> sprints.id
+parent_id?: FK -> issues.id
+sequence_id integer
+sort_order numeric
 title
-nullable description text
-priority IssuePriority cast default none
-nullable start_date date
-nullable due_date date
-nullable completed_at timestamp
-nullable archived_at timestamp
-created_by_id foreignId -> users.id
-nullable updated_by_id foreignId -> users.id
+description?: text
+priority IssuePriority default none
+start_date?: date
+due_date?: date
+completed_at?: timestamp
+archived_at?: timestamp
+created_by_id FK -> users.id
+updated_by_id?: FK -> users.id
 created_at
 updated_at
 ```
@@ -318,16 +299,16 @@ updated_at
 Relationships:
 
 ```text
-belongsTo Project
-belongsTo State
-belongsTo Sprint nullable
-belongsTo Issue as parent
-hasMany Issue as children via parent_id
-belongsTo User as creator via created_by_id
-belongsTo User as updater via updated_by_id
-belongsToMany User as assignees via issue_assignees
-belongsToMany Label via issue_labels
-hasMany Comment
+many-to-one Project
+many-to-one State
+many-to-one Sprint optional
+many-to-one Issue as parent
+one-to-many Issue as children via parent_id
+many-to-one User as creator via created_by_id
+many-to-one User as updater via updated_by_id
+many-to-many User as assignees via issue_assignees
+many-to-many Label via issue_labels
+one-to-many Comment
 ```
 
 Indexes/constraints:
@@ -358,14 +339,14 @@ Important columns:
 
 ```text
 id
-project_id foreignId -> projects.id
+project_id FK -> projects.id
 name
-nullable description text
-nullable start_date date
-nullable end_date date
-owner_id foreignId -> users.id // sprint lead; defaults to creator
-status SprintStatus cast default planned
-nullable archived_at timestamp
+description?: text
+start_date?: date
+end_date?: date
+owner_id FK -> users.id // sprint lead; defaults to creator
+status SprintStatus default planned
+archived_at?: timestamp
 created_at
 updated_at
 ```
@@ -373,9 +354,9 @@ updated_at
 Relationships:
 
 ```text
-belongsTo Project
-belongsTo User as owner
-hasMany Issue
+many-to-one Project
+many-to-one User as owner
+one-to-many Issue
 ```
 
 Indexes/constraints:
@@ -394,13 +375,13 @@ Rules:
 
 ### Sprint assignment
 
-For Plane Light, model sprint membership directly on `issues.sprint_id` instead of using a pivot table.
+For Plane Light, model sprint membership directly on `issues.sprint_id` instead of using a join table.
 
-This keeps the Laravel relationship simple:
+This keeps the relationship simple:
 
 ```text
-Sprint hasMany Issue
-Issue belongsTo Sprint nullable
+Sprint one-to-many Issue
+Issue many-to-one Sprint optional
 ```
 
 Rules:
@@ -408,7 +389,7 @@ Rules:
 - An issue can belong to zero or one sprint at a time.
 - Issue and sprint must belong to the same project.
 - Moving an issue between sprints is a normal issue update: change `sprint_id`.
-- Use a pivot table only if the product later needs sprint history, spillover tracking, or many-to-many sprint planning metadata.
+- Use a join table only if the product later needs sprint history, spillover tracking, or many-to-many sprint planning metadata.
 
 ### `labels`
 
@@ -418,7 +399,7 @@ Important columns:
 
 ```text
 id
-project_id foreignId -> projects.id
+project_id FK -> projects.id
 name
 color
 created_at
@@ -428,8 +409,8 @@ updated_at
 Relationships:
 
 ```text
-belongsTo Project
-belongsToMany Issue via issue_labels
+many-to-one Project
+many-to-many Issue via issue_labels
 ```
 
 Indexes/constraints:
@@ -444,9 +425,9 @@ Important columns:
 
 ```text
 id
-project_id foreignId -> projects.id
-issue_id foreignId -> issues.id
-author_id foreignId -> users.id
+project_id FK -> projects.id
+issue_id FK -> issues.id
+author_id FK -> users.id
 body text
 created_at
 updated_at
@@ -455,9 +436,9 @@ updated_at
 Relationships:
 
 ```text
-belongsTo Project
-belongsTo Issue
-belongsTo User as author
+many-to-one Project
+many-to-one Issue
+many-to-one User as author
 ```
 
 ### Minimal Domain UML
@@ -501,35 +482,35 @@ classDiagram
 
 ---
 
-## Laravel + Inertia Backend Design
+## Backend Application Design
 
-Use a conventional Laravel app with Inertia serving the UI. Keep the design close to Laravel defaults to reduce boilerplate:
+Use a conventional server-rendered or API-backed web application. Keep the design close to the defaults of the chosen stack to reduce boilerplate:
 
-- **Models**: Eloquent models for first-class domain entities.
-- **Controllers**: Resource Controllers for CRUD.
-- **Validation/authorization**: Form Requests and Policies.
-- **Serialization**: Eloquent API Resources for JSON/Inertia props.
-- **UI**: Inertia pages under `resources/js/Pages`.
-- **Workflow logic**: small service/action methods only when controller code would become unclear.
+- **Entities/models**: first-class domain records for projects, states, issues, sprints, labels, comments, users, and project membership.
+- **Controllers/handlers**: thin request handlers for resource-oriented CRUD and domain actions.
+- **Validation/authorization**: explicit request validation plus project-scoped authorization checks.
+- **Serialization/view models**: a clear response boundary for shaping data sent to the UI.
+- **UI**: pages/views organized around product screens, not around database tables.
+- **Workflow logic**: small service/action functions only when controller code would become unclear.
 
 ### Structure Approach
 
-Do not prescribe a custom folder structure up front. Start from the structure generated by the chosen Laravel + Inertia bootstrap path.
+Do not prescribe a custom folder structure up front. Start from the structure generated by the chosen framework or application bootstrap path.
 
-Add application-specific classes only where Laravel conventions make them useful:
+Add application-specific classes/modules only where they make the design clearer:
 
-- Eloquent models for first-class domain entities.
-- Resource Controllers for CRUD-like resources.
-- Form Requests when validation/authorization grows beyond simple cases.
-- Gates for role-level authorization (e.g. `is-admin`, `is-member`) and Policies for model-scoped authorization (e.g. project access, issue mutations).
-- API Resources when response/Inertia prop shaping needs to be explicit.
-- Small action/service classes only when a workflow becomes too large for a controller method.
+- Domain entities/models for first-class records.
+- Resource-oriented controllers/handlers for CRUD-like resources.
+- Request validators/schemas when validation grows beyond simple cases.
+- Authorization rules for role-level and model-scoped decisions.
+- Response serializers/view models when UI/API shape needs to be explicit.
+- Small action/service functions only when a workflow becomes too large for a controller/handler method.
 
 The goal is to lean on generated framework structure, not lock the application into a hand-designed directory layout before implementation.
 
 ### Routing Approach
 
-Use `routes/web.php` for Inertia pages and mutations. Prefer `Route::resource` for normal CRUD and add named custom routes only for domain actions.
+Use resource-oriented routes for normal CRUD and add named custom routes only for domain actions.
 
 ```text
 /projects
@@ -549,7 +530,7 @@ Use `routes/web.php` for Inertia pages and mutations. Prefer `Route::resource` f
   + PUT issues/{issue}/assignees
 
 /projects/{project}/board
-  -> invokable BoardController
+  -> BoardController read endpoint/page
 
 /projects/{project}/sprints
   -> SprintController resource
@@ -564,7 +545,7 @@ Use `routes/web.php` for Inertia pages and mutations. Prefer `Route::resource` f
   -> CommentController resource
 ```
 
-Use scoped route model binding so `State`, `Issue`, `Sprint`, `Label`, and `Comment` are always resolved inside the current project context.
+Resolve `State`, `Issue`, `Sprint`, `Label`, and `Comment` inside the current project context so nested resources cannot leak across projects.
 
 ### Controller Responsibilities
 
@@ -579,32 +560,32 @@ Use scoped route model binding so `State`, `Issue`, `Sprint`, `Label`, and `Comm
 | `LabelController` | Project-scoped label CRUD. |
 | `CommentController` | Issue comment CRUD. |
 
-Mutation controllers should usually validate through Form Requests, authorize through Policies, perform the write, and redirect back with flash data for Inertia.
+Mutation controllers/handlers should usually validate input, authorize the current user's project role, perform the write, and return either a redirect or a serialized response depending on the chosen UI architecture.
 
-### Eloquent API Resources
+### Response Serialization
 
-Use API Resources as the serialization boundary for both JSON responses and Inertia props.
+Use a clear serialization boundary for both JSON responses and server-rendered page props.
 
-Recommended resources:
+Recommended response/view models:
 
 ```text
-UserResource
-ProjectResource
-StateResource
-IssueResource
-BoardResource
-SprintResource
-LabelResource
-CommentResource
+UserView
+ProjectView
+StateView
+IssueView
+BoardView
+SprintView
+LabelView
+CommentView
 ```
 
 Guidelines:
 
-- Use `Resource::collection(...)` for lists.
-- Use `whenLoaded()` for relationships like `assignees`, `labels`, `states`, and `issues`.
-- Use `whenCounted()` for counts like comments, issue totals, or sprint progress.
-- Compute presentation fields like issue key (`WEB-123`) in `IssueResource`.
-- Do not put authorization, validation, or mutation logic in resources.
+- Shape lists consistently at the response boundary.
+- Include related records intentionally (`assignees`, `labels`, `states`, `issues`) instead of relying on accidental lazy loading.
+- Include counts like comments, issue totals, or sprint progress when they are part of the screen contract.
+- Compute presentation fields like issue key (`WEB-123`) in the response/view model.
+- Do not put authorization, validation, or mutation logic in response serializers.
 
 ---
 
@@ -612,7 +593,7 @@ Guidelines:
 
 ### 1. Project scoping everywhere
 
-The Eloquent model definitions make `project_id` the main work boundary. Preserve that boundary in every query, policy, route binding, and mutation so states, issues, sprints, labels, and comments cannot leak across projects.
+The persistence model definitions make `project_id` the main work boundary. Preserve that boundary in every query, authorization check, route parameter resolution, and mutation so states, issues, sprints, labels, and comments cannot leak across projects.
 
 ### 2. Project-local issue keys
 
@@ -706,10 +687,10 @@ Avoid saved views/advanced filter DSL until the basic product is solid.
 
 ## Minimal Route Surface
 
-The concrete route shape should follow the Laravel routing approach above rather than maintaining a second exhaustive API map. The minimum route surface is:
+The concrete route shape should follow the routing approach above rather than maintaining a second exhaustive API map. The minimum route surface is:
 
 ```text
-Auth/session routes from the chosen Laravel starter kit
+Auth/session routes from the chosen application framework
 Project resource routes
 Nested project member resource routes
 Nested state resource routes plus default/reorder actions
@@ -856,7 +837,7 @@ Comment
 Sprint
 ```
 
-With these persistence-only relationship tables:
+With these persistence-only join tables:
 
 ```text
 issue_assignees
